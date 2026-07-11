@@ -1,0 +1,12 @@
+{
+  "name": "remote-control-relay",
+  "version": "0.1.0",
+  "description": "Dumb WebSocket relay + pairing server for the remote-control app",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
+}

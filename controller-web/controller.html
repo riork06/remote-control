@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Remote Control — Controller</title>
+<style>
+  body { font-family: system-ui, sans-serif; background: #111; color: #eee; margin: 0; padding: 16px; }
+  #setup { max-width: 420px; margin: 40px auto; }
+  #setup input, #setup button { font-size: 16px; padding: 8px; margin-top: 8px; width: 100%; box-sizing: border-box; }
+  #status { margin-top: 12px; font-size: 14px; color: #9c9; min-height: 20px; }
+  #canvasWrap { display: none; text-align: center; }
+  canvas { max-width: 100%; border: 1px solid #444; cursor: crosshair; background: #000; }
+</style>
+</head>
+<body>
+
+<div id="setup">
+  <h2>Remote Control — Controller</h2>
+  <label>Relay server (wss:// URL)</label>
+  <input id="relayUrl" value="wss://YOUR_PRODUCTION_DOMAIN" placeholder="wss://..." />
+  <button id="connectBtn">Connect</button>
+  <div id="status"></div>
+</div>
+
+<div id="canvasWrap">
+  <canvas id="screen"></canvas>
+  <p>Click/drag on the canvas to send taps/swipes to the device.</p>
+  <button id="disconnectBtn">Disconnect</button>
+</div>
+
+<script>
+/**
+ * Minimal WebRTC-free controller: decodes raw H.264 access units via the
+ * WebCodecs API (Chrome/Edge 94+, no Safari/Firefox support yet — that's
+ * the main tradeoff of the WebSocket-relay approach vs WebRTC) and renders
+ * frames to a canvas. Mouse events on the canvas are translated to
+ * device-pixel coordinates and sent as JSON commands.
+ */
+
+const statusEl = document.getElementById('status');
+const setupEl = document.getElementById('setup');
+const canvasWrapEl = document.getElementById('canvasWrap');
+const canvas = document.getElementById('screen');
+const ctx = canvas.getContext('2d');
+
+let ws = null;
+let decoder = null;
+let sawKeyframe = false;
+
+// Assumed remote device resolution; refined once we can infer it, or you
+// can have the agent send an initial JSON {"type":"resolution","w":..,"h":..}
+// message and set these from that instead of guessing.
+let deviceWidth = 1080;
+let deviceHeight = 2400;
+
+function setStatus(msg) { statusEl.textContent = msg; }
+
+document.getElementById('connectBtn').addEventListener('click', connect);
+document.getElementById('disconnectBtn').addEventListener('click', disconnect);
+
+function connect() {
+  const relayUrl = document.getElementById('relayUrl').value.trim();
+  if (!relayUrl) return;
+
+  const code = 'default';
+
+  setStatus('Connecting...');
+  if (!('VideoDecoder' in window)) {
+    setStatus('This browser does not support WebCodecs (use Chrome/Edge).');
+    return;
+  }
+
+  setupDecoder();
+
+  ws = new WebSocket(`${relayUrl}/?role=controller&code=${encodeURIComponent(code)}`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    setStatus('Connected. Waiting for video...');
+    setupEl.style.display = 'none';
+    canvasWrapEl.style.display = 'block';
+    attachInputHandlers();
+  };
+
+  ws.onclose = (ev) => {
+    setStatus(`Disconnected (${ev.code} ${ev.reason || ''})`);
+    canvasWrapEl.style.display = 'none';
+    setupEl.style.display = 'block';
+  };
+
+  ws.onerror = () => setStatus('Connection error.');
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      handleJsonMessage(ev.data);
+    } else {
+      handleVideoFrame(new Uint8Array(ev.data));
+    }
+  };
+}
+
+function disconnect() {
+  ws?.close();
+}
+
+function setupDecoder() {
+  sawKeyframe = false;
+  decoder = new VideoDecoder({
+    output: (frame) => {
+      if (canvas.width !== frame.displayWidth || canvas.height !== frame.displayHeight) {
+        canvas.width = frame.displayWidth;
+        canvas.height = frame.displayHeight;
+        deviceWidth = frame.displayWidth;
+        deviceHeight = frame.displayHeight;
+      }
+      ctx.drawImage(frame, 0, 0, canvas.width, canvas.height);
+      frame.close();
+    },
+    error: (e) => setStatus(`Decoder error: ${e.message}`)
+  });
+
+  // Baseline profile config; adjust codec string if your encoder uses a
+  // different H.264 profile/level than the default MediaCodec baseline.
+  decoder.configure({
+    codec: 'avc1.42E01E',
+    optimizeForLatency: true
+  });
+}
+
+function handleJsonMessage(text) {
+  try {
+    const msg = JSON.parse(text);
+    if (msg.type === 'peer-joined') {
+      setStatus(`Peer joined: ${msg.role}`);
+    }
+  } catch (_) {
+    // ignore
+  }
+}
+
+function handleVideoFrame(bytes) {
+  // Strip the 9-byte header added by ControlChannelClient.sendVideoFrame:
+  // [0] flags (bit0 = keyframe), [1..8] presentationTimeUs (big-endian)
+  const flags = bytes[0];
+  const isKeyFrame = (flags & 0x1) !== 0;
+  const dv = new DataView(bytes.buffer, bytes.byteOffset + 1, 8);
+  const ptsUs = dv.getBigUint64(0, false);
+  const payload = bytes.subarray(9);
+
+  if (!sawKeyframe) {
+    if (!isKeyFrame) return; // wait for the first keyframe before decoding
+    sawKeyframe = true;
+  }
+
+  const chunk = new EncodedVideoChunk({
+    type: isKeyFrame ? 'key' : 'delta',
+    timestamp: Number(ptsUs),
+    data: payload
+  });
+  try {
+    decoder.decode(chunk);
+  } catch (e) {
+    setStatus(`Decode error, resetting: ${e.message}`);
+    setupDecoder();
+  }
+}
+
+// ---- Input handling -----------------------------------------------
+
+function attachInputHandlers() {
+  let dragStart = null;
+
+  canvas.addEventListener('mousedown', (e) => {
+    dragStart = canvasToDeviceCoords(e);
+  });
+
+  canvas.addEventListener('mouseup', (e) => {
+    if (!dragStart) return;
+    const end = canvasToDeviceCoords(e);
+    const dx = end.x - dragStart.x;
+    const dy = end.y - dragStart.y;
+    if (Math.hypot(dx, dy) < 8) {
+      sendCommand({ type: 'tap', x: dragStart.x, y: dragStart.y });
+    } else {
+      sendCommand({
+        type: 'swipe',
+        x1: dragStart.x, y1: dragStart.y,
+        x2: end.x, y2: end.y,
+        durationMs: 200
+      });
+    }
+    dragStart = null;
+  });
+}
+
+function canvasToDeviceCoords(mouseEvent) {
+  const rect = canvas.getBoundingClientRect();
+  const scaleX = deviceWidth / rect.width;
+  const scaleY = deviceHeight / rect.height;
+  return {
+    x: (mouseEvent.clientX - rect.left) * scaleX,
+    y: (mouseEvent.clientY - rect.top) * scaleY
+  };
+}
+
+function sendCommand(obj) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify(obj));
+  }
+}
+</script>
+</body>
+</html>

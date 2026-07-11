@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Remote Control</string>
+    <string name="a11y_service_description">Allows this device to receive remote taps and swipes when you have an active screen-sharing session. Only active while you have this enabled.</string>
+</resources>
