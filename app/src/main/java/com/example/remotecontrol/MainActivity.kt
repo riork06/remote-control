@@ -16,8 +16,8 @@ class MainActivity : AppCompatActivity() {
     // Point this at your deployed relay server, e.g. "http://your-vps:8080"
     // or "https://your-domain" if behind TLS (use wss:// in that case below).
     // For production, point this to your actual domain with HTTPS/WSS enabled (e.g., via Nginx)
-    private val relayHttpBase = "https://YOUR_PRODUCTION_DOMAIN"
-    private val relayWsBase = "wss://YOUR_PRODUCTION_DOMAIN"
+    private val relayHttpBase = "https://remote-control-relay.onrender.com"
+    private val relayWsBase = "wss://remote-control-relay.onrender.com"
 
     private lateinit var projectionManager: MediaProjectionManager
     private lateinit var statusText: TextView
